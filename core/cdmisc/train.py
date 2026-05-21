@@ -27,7 +27,6 @@ def _prepare_label(labels):
         0: unchanged
         1: changed
     """
-
     if not isinstance(labels, paddle.Tensor):
         labels = paddle.to_tensor(labels)
 
@@ -69,7 +68,6 @@ def bcd_loss(logits, labels, dice_weight=1.0, eps=1e-6):
     Loss:
         CrossEntropy + Dice Loss
     """
-
     labels = _prepare_label(labels)
 
     if isinstance(logits, (tuple, list)):
@@ -84,7 +82,7 @@ def bcd_loss(logits, labels, dice_weight=1.0, eps=1e-6):
             logits,
             size=labels.shape[-2:],
             mode="bilinear",
-            align_corners=True
+            align_corners=True,
         )
 
     # Case 1: two-class output [B, 2, H, W]
@@ -94,7 +92,7 @@ def bcd_loss(logits, labels, dice_weight=1.0, eps=1e-6):
         ce_loss = F.cross_entropy(
             input=logits,
             label=labels_ce,
-            axis=1
+            axis=1,
         )
 
         probs = F.softmax(logits, axis=1)
@@ -114,11 +112,10 @@ def bcd_loss(logits, labels, dice_weight=1.0, eps=1e-6):
 
         bce_loss = F.binary_cross_entropy_with_logits(
             logit=logits,
-            label=target
+            label=target,
         )
 
         probs = F.sigmoid(logits)
-
         intersection = paddle.sum(probs * target)
         union = paddle.sum(probs) + paddle.sum(target)
 
@@ -134,126 +131,181 @@ def bcd_loss(logits, labels, dice_weight=1.0, eps=1e-6):
         )
 
 
-def _l2_normalize_feature(x, eps=1e-6):
+def _to_list(x):
     """
-    L2 normalize feature along channel dimension.
+    Convert Tensor to list[Tensor].
+    """
+    if x is None:
+        return None
 
-    x: [B, C, H, W]
-    """
-    norm = paddle.sqrt(paddle.sum(x * x, axis=1, keepdim=True)) + eps
-    return x / norm
+    if isinstance(x, (list, tuple)):
+        return list(x)
+
+    return [x]
 
 
-def _masked_mean(x, mask, eps=1e-6):
+def _kl_divergence_with_temperature(x_t1, x_t2, axis, temperature=4.0):
     """
-    x:    [B, H, W]
-    mask: [B, H, W]
+    KL divergence with temperature.
+
+    KL(p_t1 || p_t2)
+        = sum p_t1 * (log p_t1 - log p_t2)
+
+    Args:
+        x_t1: feature tensor from optical branch
+        x_t2: feature tensor from SAR branch
+        axis: dimension used to calculate softmax distribution
+        temperature: temperature factor T
     """
-    return paddle.sum(x * mask) / (paddle.sum(mask) + eps)
+    t = float(temperature)
+
+    p_t1 = F.softmax(x_t1 / t, axis=axis)
+    log_p_t1 = F.log_softmax(x_t1 / t, axis=axis)
+    log_p_t2 = F.log_softmax(x_t2 / t, axis=axis)
+
+    kl = paddle.sum(p_t1 * (log_p_t1 - log_p_t2), axis=axis)
+
+    return kl
 
 
 def hetecd_fca_loss(
-        feats_opt,
-        feats_sar,
-        labels,
-        temperature=4.0,
-        changed_weight=0.0,
-        margin=0.2,
-        eps=1e-6
+    feats_opt,
+    feats_sar,
+    temperature=4.0,
+    eps=1e-6,
 ):
     """
-    HeteCD-style FCA loss: Feature Consistency Alignment Loss.
+    FCA Loss following the original HeteCD paper.
 
-    Purpose:
-        Align optical and SAR features in unchanged regions.
+    This version is different from the previous mask-based cosine FCA.
 
-    Inputs:
-        feats_opt: list of optical features.
-                   Each feature shape: [B, C, H, W]
+    Original idea:
+        1. Align heterogeneous feature distributions by KL divergence.
+        2. Calculate distribution consistency from spatial dimension.
+        3. Calculate distribution consistency from channel dimension.
+        4. No unchanged-region mask is used here.
 
-        feats_sar: list of SAR features.
-                   Each feature shape: [B, C, H, W]
+    Args:
+        feats_opt:
+            Optical features. Tensor or list[Tensor].
+            Each tensor shape: [B, C, H, W]
 
-        labels:    [B, H, W] or [B, 1, H, W]
-                   0 = unchanged
-                   1 = changed
+        feats_sar:
+            SAR features. Tensor or list[Tensor].
+            Each tensor shape: [B, C, H, W]
 
-    Main idea:
-        Unchanged pixels:
-            optical feature and SAR feature should be consistent.
+        temperature:
+            Temperature factor T. Default is 4.0.
 
-        Changed pixels:
-            by default, we do not force alignment.
-            changed_weight can be set > 0 if you want weak separation.
+        eps:
+            Small value for numerical safety.
+
+    Returns:
+        FCA loss.
     """
+    if feats_opt is None or feats_sar is None:
+        return paddle.to_tensor(0.0, dtype="float32")
 
-    labels = _prepare_label(labels)
+    feats_opt = _to_list(feats_opt)
+    feats_sar = _to_list(feats_sar)
 
     if feats_opt is None or feats_sar is None:
         return paddle.to_tensor(0.0, dtype="float32")
 
-    if not isinstance(feats_opt, (list, tuple)):
-        feats_opt = [feats_opt]
-
-    if not isinstance(feats_sar, (list, tuple)):
-        feats_sar = [feats_sar]
-
     total_fca_loss = paddle.to_tensor(0.0, dtype="float32")
     valid_scales = 0
 
-    temp = max(float(temperature), eps)
+    t = max(float(temperature), eps)
 
     for fo, fs in zip(feats_opt, feats_sar):
-        # fo, fs: [B, C, H, W]
-        h, w = fo.shape[2], fo.shape[3]
+        if fo is None or fs is None:
+            continue
 
-        if fs.shape[-2:] != fo.shape[-2:]:
+        # fo, fs: [B, C, H, W]
+        if len(fo.shape) != 4 or len(fs.shape) != 4:
+            raise ValueError(
+                "FCA features must be 4D tensors with shape [B, C, H, W]. "
+                f"Got fo.shape={fo.shape}, fs.shape={fs.shape}."
+            )
+
+        b, c, h, w = fo.shape
+        _, c_sar, h_sar, w_sar = fs.shape
+
+        # Resize SAR feature to optical feature size if needed.
+        if (h_sar, w_sar) != (h, w):
             fs = F.interpolate(
                 fs,
                 size=(h, w),
                 mode="bilinear",
-                align_corners=True
+                align_corners=True,
             )
 
-        # Resize label to current feature scale.
-        label_small = labels.astype("float32").unsqueeze(1)
-        label_small = F.interpolate(
-            label_small,
-            size=(h, w),
-            mode="nearest"
-        )
-        label_small = label_small.squeeze(1).astype("int64")
-
-        unchanged_mask = (label_small == 0).astype("float32")
-        changed_mask = (label_small == 1).astype("float32")
-
-        fo_norm = _l2_normalize_feature(fo, eps)
-        fs_norm = _l2_normalize_feature(fs, eps)
-
-        # Cosine similarity: [B, H, W], range roughly [-1, 1]
-        cos_sim = paddle.sum(fo_norm * fs_norm, axis=1)
-
-        # FCA for unchanged regions:
-        # larger similarity -> smaller loss.
-        unchanged_loss_map = (1.0 - cos_sim) / temp
-        unchanged_loss = _masked_mean(
-            unchanged_loss_map,
-            unchanged_mask,
-            eps=eps
-        )
-
-        # Optional weak separation for changed regions.
-        # Default changed_weight = 0.0, so changed regions are not forced.
-        if changed_weight > 0:
-            changed_loss_map = F.relu(cos_sim - margin)
-            changed_loss = _masked_mean(
-                changed_loss_map,
-                changed_mask,
-                eps=eps
+        if c_sar != c:
+            raise ValueError(
+                "Optical and SAR features must have the same channel number "
+                "for HeteCD FCA KL alignment. "
+                f"Got optical C={c}, SAR C={c_sar}."
             )
-            scale_loss = unchanged_loss + changed_weight * changed_loss
-        else:
-            scale_loss = unchanged_loss
+
+        hw = h * w
+
+        # ------------------------------------------------------------
+        # 1. Spatial-position distribution alignment
+        # ------------------------------------------------------------
+        # For each spatial position i, compare the channel distributions:
+        #     p(X_t1^i) and p(X_t2^i)
+        #
+        # Original formula:
+        #     T^2 / HW * sum_i KL(p(X_t1^i) || p(X_t2^i))
+        #
+        # Tensor transform:
+        #     [B, C, H, W] -> [B, C, HW] -> [B, HW, C]
+        # Softmax axis:
+        #     channel dimension C
+        # ------------------------------------------------------------
+        fo_pos = paddle.reshape(fo, [b, c, hw])
+        fs_pos = paddle.reshape(fs, [b, c, hw])
+
+        fo_pos = paddle.transpose(fo_pos, [0, 2, 1])
+        fs_pos = paddle.transpose(fs_pos, [0, 2, 1])
+
+        spatial_kl = _kl_divergence_with_temperature(
+            fo_pos,
+            fs_pos,
+            axis=-1,
+            temperature=t,
+        )
+
+        spatial_loss = paddle.mean(spatial_kl)
+
+        # ------------------------------------------------------------
+        # 2. Channel distribution alignment
+        # ------------------------------------------------------------
+        # For each channel c, compare the spatial distributions:
+        #     p(X_t1^c) and p(X_t2^c)
+        #
+        # Original formula:
+        #     T^2 / C * sum_c KL(p(X_t1^c) || p(X_t2^c))
+        #
+        # Tensor transform:
+        #     [B, C, H, W] -> [B, C, HW]
+        # Softmax axis:
+        #     spatial dimension HW
+        # ------------------------------------------------------------
+        fo_channel = paddle.reshape(fo, [b, c, hw])
+        fs_channel = paddle.reshape(fs, [b, c, hw])
+
+        channel_kl = _kl_divergence_with_temperature(
+            fo_channel,
+            fs_channel,
+            axis=-1,
+            temperature=t,
+        )
+
+        channel_loss = paddle.mean(channel_kl)
+
+        # HeteCD uses T^2 as the scale factor.
+        scale_loss = (t * t) * (spatial_loss + channel_loss)
 
         total_fca_loss = total_fca_loss + scale_loss
         valid_scales += 1
@@ -269,17 +321,15 @@ def _forward_model(model, data, return_aux=False):
     Forward wrapper.
 
     Compatible with:
+        1. data["img"] = concat(A, B)
+           model(data["img"], return_aux=True/False)
 
-    1. data["img"] = concat(A, B)
-       model(data["img"], return_aux=True/False)
+        2. data["img_a"], data["img_b"]
+           model(data["img_a"], data["img_b"], return_aux=True/False)
 
-    2. data["img_a"], data["img_b"]
-       model(data["img_a"], data["img_b"], return_aux=True/False)
-
-    3. data["A"], data["B"]
-       model(data["A"], data["B"], return_aux=True/False)
+        3. data["A"], data["B"]
+           model(data["A"], data["B"], return_aux=True/False)
     """
-
     if "img_a" in data and "img_b" in data:
         img_a = data["img_a"].astype("float32")
         img_b = data["img_b"].astype("float32")
@@ -315,20 +365,27 @@ def _to_float(x):
     """
     if isinstance(x, paddle.Tensor):
         return float(x.detach().cpu().numpy())
+
     return float(x)
 
 
 def train(model, train_dataset, val_dataset, test_dataset, args):
     """
-    Launch training for binary change detection with optional FCA loss.
+    Launch training for binary change detection with optional HeteCD FCA loss.
 
-    Total loss:
-        loss_total = seg_loss + fca_weight * fca_loss
+    Total loss follows the original HeteCD paper:
 
-    When args.fca_weight > 0:
-        model will be called with return_aux=True.
+        loss_total = seg_loss + alpha / epoch * fca_loss
+
+    In this implementation:
+
+        alpha = args.fca_weight
+
+    Recommended setting:
+
+        args.fca_weight = 2.0
+        args.fca_temperature = 4.0
     """
-
     logger = getattr(args, "logger", None)
 
     if logger is not None:
@@ -342,9 +399,10 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
 
     if use_fca:
         msg = (
-            "[FCA] enabled. "
-            f"fca_weight={getattr(args, 'fca_weight', 0.0)}, "
-            f"fca_temperature={getattr(args, 'fca_temperature', 4.0)}"
+            "[FCA] enabled with HeteCD KL distribution alignment. "
+            f"alpha={getattr(args, 'fca_weight', 0.0)}, "
+            f"temperature={getattr(args, 'fca_temperature', 4.0)}, "
+            "effective_weight = alpha / epoch"
         )
     else:
         msg = "[FCA] disabled. Set --fca_weight > 0 to enable."
@@ -358,18 +416,17 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
     lr_scheduler = paddle.optimizer.lr.CosineAnnealingDecay(
         learning_rate=args.lr,
         T_max=max(1, args.iters),
-        last_epoch=-1
+        last_epoch=-1,
     )
 
     optimizer = paddle.optimizer.Adam(
         learning_rate=lr_scheduler,
         parameters=model.parameters(),
-        weight_decay=getattr(args, "weight_decay", 0.0)
+        weight_decay=getattr(args, "weight_decay", 0.0),
     )
 
     best_mean_iou = -1.0
     best_model_iter = -1
-
     batch_start = time.time()
 
     for epoch in range(1, args.iters + 1):
@@ -378,11 +435,12 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
         avg_loss_list = []
         avg_seg_loss_list = []
         avg_fca_loss_list = []
+        avg_effective_fca_weight_list = []
 
         progress_bar = tqdm(
             train_dataset,
             desc=f"Epoch [{epoch}/{args.iters}]",
-            ncols=120
+            ncols=120,
         )
 
         for data in progress_bar:
@@ -409,13 +467,13 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
                 fca_loss_value = hetecd_fca_loss(
                     feats_opt=fca_opt,
                     feats_sar=fca_sar,
-                    labels=labels,
                     temperature=getattr(args, "fca_temperature", 4.0),
-                    changed_weight=getattr(args, "fca_changed_weight", 0.0),
-                    margin=getattr(args, "fca_margin", 0.2)
                 )
 
-                loss_total = seg_loss + getattr(args, "fca_weight", 0.0) * fca_loss_value
+                alpha = float(getattr(args, "fca_weight", 0.0))
+                effective_fca_weight = alpha / float(max(epoch, 1))
+
+                loss_total = seg_loss + effective_fca_weight * fca_loss_value
 
             else:
                 pred = _forward_model(model, data, return_aux=False)
@@ -432,6 +490,7 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
                     seg_loss = bcd_loss(pred, labels)
 
                 fca_loss_value = paddle.to_tensor(0.0, dtype="float32")
+                effective_fca_weight = 0.0
                 loss_total = seg_loss
 
             loss_total.backward()
@@ -450,27 +509,39 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
             avg_loss_list.append(loss_value)
             avg_seg_loss_list.append(seg_loss_value)
             avg_fca_loss_list.append(fca_loss_float)
+            avg_effective_fca_weight_list.append(effective_fca_weight)
 
             if use_fca:
                 progress_bar.set_postfix(
                     total=f"{loss_value:.4f}",
                     seg=f"{seg_loss_value:.4f}",
                     fca=f"{fca_loss_float:.4f}",
-                    lr=f"{lr:.6f}"
+                    w=f"{effective_fca_weight:.4f}",
+                    lr=f"{lr:.6f}",
                 )
             else:
                 progress_bar.set_postfix(
                     loss=f"{loss_value:.4f}",
-                    lr=f"{lr:.6f}"
+                    lr=f"{lr:.6f}",
                 )
 
         batch_cost = time.time() - batch_start
 
         avg_loss = float(np.mean(avg_loss_list)) if len(avg_loss_list) > 0 else 0.0
-        avg_seg_loss = float(np.mean(avg_seg_loss_list)) if len(avg_seg_loss_list) > 0 else 0.0
-        avg_fca_loss = float(np.mean(avg_fca_loss_list)) if len(avg_fca_loss_list) > 0 else 0.0
+        avg_seg_loss = (
+            float(np.mean(avg_seg_loss_list)) if len(avg_seg_loss_list) > 0 else 0.0
+        )
+        avg_fca_loss = (
+            float(np.mean(avg_fca_loss_list)) if len(avg_fca_loss_list) > 0 else 0.0
+        )
+        avg_effective_fca_weight = (
+            float(np.mean(avg_effective_fca_weight_list))
+            if len(avg_effective_fca_weight_list) > 0
+            else 0.0
+        )
 
         train_num = getattr(args, "traindata_num", None)
+
         if train_num is not None and train_num > 0:
             ips = train_num / max(batch_cost, 1e-6)
         else:
@@ -479,7 +550,7 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
         if use_fca:
             train_msg = (
                 "[TRAIN] iter: {}/{}, total_loss: {:.4f}, seg_loss: {:.4f}, "
-                "fca_loss: {:.4f}, fca_weight: {:.4f}, lr: {:.6f}, "
+                "fca_loss: {:.4f}, effective_fca_weight: {:.4f}, lr: {:.6f}, "
                 "batch_cost: {:.2f}, ips: {:.4f} samples/sec"
             ).format(
                 epoch,
@@ -487,10 +558,10 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
                 avg_loss,
                 avg_seg_loss,
                 avg_fca_loss,
-                getattr(args, "fca_weight", 0.0),
+                avg_effective_fca_weight,
                 lr,
                 batch_cost,
-                ips
+                ips,
             )
         else:
             train_msg = (
@@ -502,7 +573,7 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
                 avg_loss,
                 lr,
                 batch_cost,
-                ips
+                ips,
             )
 
         if logger is not None:
@@ -535,7 +606,7 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
                     "[SAVE] best model saved to {}, iter {}, max IoU {:.4f}".format(
                         args.best_model_path,
                         best_model_iter,
-                        best_mean_iou
+                        best_mean_iou,
                     )
                 )
             else:
@@ -543,13 +614,13 @@ def train(model, train_dataset, val_dataset, test_dataset, args):
                     "[SAVE] best model saved to {}, iter {}, max IoU {:.4f}".format(
                         args.best_model_path,
                         best_model_iter,
-                        best_mean_iou
+                        best_mean_iou,
                     )
                 )
 
         best_msg = "[TRAIN] best iter {}, max IoU {:.4f}".format(
             best_model_iter,
-            best_mean_iou
+            best_mean_iou,
         )
 
         if logger is not None:

@@ -2,6 +2,13 @@
 # Put this file in the root directory of your local CM-HeteCD-FILoRA project.
 # It trains filora/cm_hetecd_sam2_sf_v1_torch.py with official SAM2 image encoder.
 #
+# HeteCD-style train augmentation enabled by default:
+#   random horizontal flip
+#   random vertical flip
+#   scale random crop, scale in [1.0, 1.2]
+#   random Gaussian blur
+#   ColorJitter, brightness/contrast/saturation/hue = 0.3
+#
 # Expected default dataset structure:
 #   DATA_ROOT/
 #     train/
@@ -29,7 +36,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -79,13 +86,49 @@ TEST_LABEL_DIR = None
 
 # 常用训练参数
 IMG_SIZE = 512
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 EPOCHS = 100
 NUM_WORKERS = 4
 LR = 5e-4
+WEIGHT_DECAY = 1e-4
 DECODER_DIM = 96
 LORA_R = 4
 LORA_ALPHA = 8
+
+
+# =============================
+# HeteCD-style augmentation config
+# =============================
+# 对应 HeteCD 中启用的增强：
+# hflip / vflip / scale_random_crop / random_blur / color_jitter
+AUG_HFLIP = True
+AUG_VFLIP = True
+AUG_SCALE_RANDOM_CROP = True
+AUG_RANDOM_BLUR = True
+AUG_COLOR_JITTER = True
+
+# HeteCD 代码里有 random rotation，但默认没有启用。这里也默认关闭。
+AUG_RANDOM_ROT = False
+
+# HeteCD scale_random_crop 常用范围：1.0 ~ 1.2
+SCALE_MIN = 1.0
+SCALE_MAX = 1.2
+
+# Gaussian blur
+BLUR_PROB = 0.5
+BLUR_RADIUS_MIN = 0.1
+BLUR_RADIUS_MAX = 2.0
+
+# ColorJitter: brightness/contrast/saturation/hue = 0.3
+COLOR_JITTER_PROB = 1.0
+COLOR_BRIGHTNESS = 0.3
+COLOR_CONTRAST = 0.3
+COLOR_SATURATION = 0.3
+COLOR_HUE = 0.3
+
+# 为了先按照 HeteCD 的方式，默认 Optical 和 SAR 都做 ColorJitter。
+# 如果后续发现 SAR 被扰动后性能下降，可以改成 False。
+COLOR_JITTER_ON_SAR = True
 
 
 def set_seed(seed: int = 32767):
@@ -135,6 +178,70 @@ def list_image_files(folder: Path) -> Dict[str, Path]:
     return files
 
 
+def color_jitter_pil(
+    img: Image.Image,
+    brightness: float = 0.3,
+    contrast: float = 0.3,
+    saturation: float = 0.3,
+    hue: float = 0.3,
+) -> Image.Image:
+    """PIL implementation of ColorJitter-like transform."""
+    if brightness > 0:
+        factor = random.uniform(max(0.0, 1.0 - brightness), 1.0 + brightness)
+        img = ImageEnhance.Brightness(img).enhance(factor)
+
+    if contrast > 0:
+        factor = random.uniform(max(0.0, 1.0 - contrast), 1.0 + contrast)
+        img = ImageEnhance.Contrast(img).enhance(factor)
+
+    if saturation > 0:
+        factor = random.uniform(max(0.0, 1.0 - saturation), 1.0 + saturation)
+        img = ImageEnhance.Color(img).enhance(factor)
+
+    if hue > 0:
+        hue_factor = random.uniform(-hue, hue)
+        hsv = img.convert("HSV")
+        h, s, v = hsv.split()
+        h_np = np.asarray(h).astype(np.uint16)
+        delta = int(hue_factor * 255)
+        h_np = ((h_np + delta) % 255).astype(np.uint8)
+        h = Image.fromarray(h_np, mode="L")
+        img = Image.merge("HSV", (h, s, v)).convert("RGB")
+
+    return img
+
+
+def scale_random_crop_pil(
+    opt: Image.Image,
+    sar: Image.Image,
+    lab: Image.Image,
+    img_size: int,
+    scale_min: float = 1.0,
+    scale_max: float = 1.2,
+):
+    """
+    Resize to a random scale in [1.0, 1.2], then random crop back to img_size.
+    Optical/SAR/label use the same crop to keep pixel alignment.
+    """
+    scale = random.uniform(scale_min, scale_max)
+    scaled_size = max(img_size, int(round(img_size * scale)))
+
+    if scaled_size == img_size:
+        return opt, sar, lab
+
+    opt = opt.resize((scaled_size, scaled_size), Image.BILINEAR)
+    sar = sar.resize((scaled_size, scaled_size), Image.BILINEAR)
+    lab = lab.resize((scaled_size, scaled_size), Image.NEAREST)
+
+    max_x = scaled_size - img_size
+    max_y = scaled_size - img_size
+    left = random.randint(0, max_x)
+    top = random.randint(0, max_y)
+    box = (left, top, left + img_size, top + img_size)
+
+    return opt.crop(box), sar.crop(box), lab.crop(box)
+
+
 class HeteCDTorchDataset(Dataset):
     def __init__(
         self,
@@ -143,12 +250,47 @@ class HeteCDTorchDataset(Dataset):
         label_dir: str,
         img_size: int = 512,
         augment: bool = False,
+        aug_hflip: bool = True,
+        aug_vflip: bool = True,
+        aug_random_rot: bool = False,
+        aug_scale_random_crop: bool = True,
+        aug_random_blur: bool = True,
+        aug_color_jitter: bool = True,
+        color_jitter_on_sar: bool = True,
+        scale_min: float = 1.0,
+        scale_max: float = 1.2,
+        blur_prob: float = 0.5,
+        blur_radius_min: float = 0.1,
+        blur_radius_max: float = 2.0,
+        color_jitter_prob: float = 1.0,
+        color_brightness: float = 0.3,
+        color_contrast: float = 0.3,
+        color_saturation: float = 0.3,
+        color_hue: float = 0.3,
     ):
         self.opt_dir = Path(opt_dir)
         self.sar_dir = Path(sar_dir)
         self.label_dir = Path(label_dir)
         self.img_size = int(img_size)
         self.augment = augment
+
+        self.aug_hflip = aug_hflip
+        self.aug_vflip = aug_vflip
+        self.aug_random_rot = aug_random_rot
+        self.aug_scale_random_crop = aug_scale_random_crop
+        self.aug_random_blur = aug_random_blur
+        self.aug_color_jitter = aug_color_jitter
+        self.color_jitter_on_sar = color_jitter_on_sar
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+        self.blur_prob = blur_prob
+        self.blur_radius_min = blur_radius_min
+        self.blur_radius_max = blur_radius_max
+        self.color_jitter_prob = color_jitter_prob
+        self.color_brightness = color_brightness
+        self.color_contrast = color_contrast
+        self.color_saturation = color_saturation
+        self.color_hue = color_hue
 
         opt_files = list_image_files(self.opt_dir)
         sar_files = list_image_files(self.sar_dir)
@@ -186,14 +328,68 @@ class HeteCDTorchDataset(Dataset):
         lab = lab.resize(size, Image.NEAREST)
 
         if self.augment:
-            if random.random() < 0.5:
+            # 1. Random horizontal flip
+            if self.aug_hflip and random.random() < 0.5:
                 opt = opt.transpose(Image.FLIP_LEFT_RIGHT)
                 sar = sar.transpose(Image.FLIP_LEFT_RIGHT)
                 lab = lab.transpose(Image.FLIP_LEFT_RIGHT)
-            if random.random() < 0.5:
+
+            # 2. Random vertical flip
+            if self.aug_vflip and random.random() < 0.5:
                 opt = opt.transpose(Image.FLIP_TOP_BOTTOM)
                 sar = sar.transpose(Image.FLIP_TOP_BOTTOM)
                 lab = lab.transpose(Image.FLIP_TOP_BOTTOM)
+
+            # 3. Optional random 90/180/270 rotation. HeteCD has this code, but default was off.
+            if self.aug_random_rot:
+                k = random.randint(0, 3)
+                if k == 1:
+                    opt = opt.transpose(Image.ROTATE_90)
+                    sar = sar.transpose(Image.ROTATE_90)
+                    lab = lab.transpose(Image.ROTATE_90)
+                elif k == 2:
+                    opt = opt.transpose(Image.ROTATE_180)
+                    sar = sar.transpose(Image.ROTATE_180)
+                    lab = lab.transpose(Image.ROTATE_180)
+                elif k == 3:
+                    opt = opt.transpose(Image.ROTATE_270)
+                    sar = sar.transpose(Image.ROTATE_270)
+                    lab = lab.transpose(Image.ROTATE_270)
+
+            # 4. Scale random crop
+            if self.aug_scale_random_crop:
+                opt, sar, lab = scale_random_crop_pil(
+                    opt,
+                    sar,
+                    lab,
+                    img_size=self.img_size,
+                    scale_min=self.scale_min,
+                    scale_max=self.scale_max,
+                )
+
+            # 5. Random Gaussian blur. Same probability and radius for optical/SAR.
+            if self.aug_random_blur and random.random() < self.blur_prob:
+                radius = random.uniform(self.blur_radius_min, self.blur_radius_max)
+                opt = opt.filter(ImageFilter.GaussianBlur(radius=radius))
+                sar = sar.filter(ImageFilter.GaussianBlur(radius=radius))
+
+            # 6. ColorJitter. HeteCD applies color transform to both input images.
+            if self.aug_color_jitter and random.random() < self.color_jitter_prob:
+                opt = color_jitter_pil(
+                    opt,
+                    brightness=self.color_brightness,
+                    contrast=self.color_contrast,
+                    saturation=self.color_saturation,
+                    hue=self.color_hue,
+                )
+                if self.color_jitter_on_sar:
+                    sar = color_jitter_pil(
+                        sar,
+                        brightness=self.color_brightness,
+                        contrast=self.color_contrast,
+                        saturation=self.color_saturation,
+                        hue=self.color_hue,
+                    )
 
         opt_np = np.asarray(opt).astype("float32") / 255.0
         sar_np = np.asarray(sar).astype("float32") / 255.0
@@ -260,7 +456,28 @@ def build_datasets(args):
         test_root = Path(args.data_root) / "test"
         test_dirs = autodetect_split_dirs(args.data_root, "test") if test_root.exists() else val_dirs
 
-    train_set = HeteCDTorchDataset(*map(str, train_dirs), img_size=args.img_size, augment=True)
+    train_set = HeteCDTorchDataset(
+        *map(str, train_dirs),
+        img_size=args.img_size,
+        augment=True,
+        aug_hflip=args.aug_hflip,
+        aug_vflip=args.aug_vflip,
+        aug_random_rot=args.aug_random_rot,
+        aug_scale_random_crop=args.aug_scale_random_crop,
+        aug_random_blur=args.aug_random_blur,
+        aug_color_jitter=args.aug_color_jitter,
+        color_jitter_on_sar=args.color_jitter_on_sar,
+        scale_min=args.scale_min,
+        scale_max=args.scale_max,
+        blur_prob=args.blur_prob,
+        blur_radius_min=args.blur_radius_min,
+        blur_radius_max=args.blur_radius_max,
+        color_jitter_prob=args.color_jitter_prob,
+        color_brightness=args.color_brightness,
+        color_contrast=args.color_contrast,
+        color_saturation=args.color_saturation,
+        color_hue=args.color_hue,
+    )
     val_set = HeteCDTorchDataset(*map(str, val_dirs), img_size=args.img_size, augment=False)
     test_set = HeteCDTorchDataset(*map(str, test_dirs), img_size=args.img_size, augment=False)
     return train_set, val_set, test_set
@@ -283,17 +500,42 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=LORA_ALPHA)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
 
+    # HeteCD-style augmentation switches.
+    parser.add_argument("--aug_hflip", action="store_true", default=AUG_HFLIP)
+    parser.add_argument("--no_aug_hflip", action="store_false", dest="aug_hflip")
+    parser.add_argument("--aug_vflip", action="store_true", default=AUG_VFLIP)
+    parser.add_argument("--no_aug_vflip", action="store_false", dest="aug_vflip")
+    parser.add_argument("--aug_random_rot", action="store_true", default=AUG_RANDOM_ROT)
+    parser.add_argument("--aug_scale_random_crop", action="store_true", default=AUG_SCALE_RANDOM_CROP)
+    parser.add_argument("--no_aug_scale_random_crop", action="store_false", dest="aug_scale_random_crop")
+    parser.add_argument("--aug_random_blur", action="store_true", default=AUG_RANDOM_BLUR)
+    parser.add_argument("--no_aug_random_blur", action="store_false", dest="aug_random_blur")
+    parser.add_argument("--aug_color_jitter", action="store_true", default=AUG_COLOR_JITTER)
+    parser.add_argument("--no_aug_color_jitter", action="store_false", dest="aug_color_jitter")
+    parser.add_argument("--color_jitter_on_sar", action="store_true", default=COLOR_JITTER_ON_SAR)
+    parser.add_argument("--no_color_jitter_on_sar", action="store_false", dest="color_jitter_on_sar")
+    parser.add_argument("--scale_min", type=float, default=SCALE_MIN)
+    parser.add_argument("--scale_max", type=float, default=SCALE_MAX)
+    parser.add_argument("--blur_prob", type=float, default=BLUR_PROB)
+    parser.add_argument("--blur_radius_min", type=float, default=BLUR_RADIUS_MIN)
+    parser.add_argument("--blur_radius_max", type=float, default=BLUR_RADIUS_MAX)
+    parser.add_argument("--color_jitter_prob", type=float, default=COLOR_JITTER_PROB)
+    parser.add_argument("--color_brightness", type=float, default=COLOR_BRIGHTNESS)
+    parser.add_argument("--color_contrast", type=float, default=COLOR_CONTRAST)
+    parser.add_argument("--color_saturation", type=float, default=COLOR_SATURATION)
+    parser.add_argument("--color_hue", type=float, default=COLOR_HUE)
+
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--num_workers", type=int, default=NUM_WORKERS)
     parser.add_argument("--lr", type=float, default=LR)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
 
     parser.add_argument("--spa_weight", type=float, default=0.03)
     parser.add_argument("--freq_weight", type=float, default=0.02)
     parser.add_argument("--orth_weight", type=float, default=0.01)
 
-    parser.add_argument("--device", type=str, default="cuda:3")
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=32767)
     parser.add_argument("--amp", action="store_true")
 
@@ -320,6 +562,12 @@ def main():
 
     train_set, val_set, test_set = build_datasets(args)
     print(f"Train samples: {len(train_set)}, Val samples: {len(val_set)}, Test samples: {len(test_set)}")
+    print(
+        "Augmentation: "
+        f"hflip={args.aug_hflip}, vflip={args.aug_vflip}, rot={args.aug_random_rot}, "
+        f"scale_crop={args.aug_scale_random_crop}, blur={args.aug_random_blur}, "
+        f"color_jitter={args.aug_color_jitter}, color_jitter_on_sar={args.color_jitter_on_sar}"
+    )
 
     train_loader = DataLoader(
         train_set,
@@ -344,6 +592,9 @@ def main():
         pin_memory=True,
     )
 
+    # Before training, you can test the SAM2 feature shapes by setting DEBUG_FEATURE_SHAPES=True below.
+    DEBUG_FEATURE_SHAPES = False
+
     model = SAM2LoRASFChangeDetectorV1(
         sam2_repo_dir=args.sam2_repo_dir,
         sam2_cfg=args.sam2_cfg,
@@ -358,12 +609,18 @@ def main():
         device=device,
     ).to(device)
 
+    if DEBUG_FEATURE_SHAPES:
+        model.eval()
+        with torch.no_grad():
+            dummy = torch.rand(1, 3, args.img_size, args.img_size, device=device)
+            opt_feats = model.optical_encoder(dummy)
+            sar_feats = model.sar_encoder(dummy)
+            print("Optical feature shapes:", [tuple(f.shape) for f in opt_feats])
+            print("SAR feature shapes:", [tuple(f.shape) for f in sar_feats])
+        return
+
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     print(f"Trainable parameters: {sum(p.numel() for p in trainable_params) / 1e6:.2f} M")
-    print("Trainable parameter names:")
-    for name, p in model.named_parameters():
-        if p.requires_grad:
-            print(name, tuple(p.shape))
 
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
@@ -407,7 +664,7 @@ def main():
                 loss=f"{loss_value:.4f}",
                 cd=f"{float(loss_cd.detach().cpu()):.4f}",
                 aux=f"{float(aux_losses['loss_aux'].detach().cpu()):.4f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                lr=f"{optimizer.param_groups[0]['lr']:.6e}",
             )
 
         scheduler.step()
